@@ -1,8 +1,8 @@
-# 漏洞报告：VB-Audio VoiceMeeter AUX VAIO 内核驱动任意读写漏洞
+# 漏洞报告：VB-Audio VoiceMeeter AUX VAIO 内核驱动陈旧 MDL 映射漏洞
 
 ## 漏洞名称
 
-VB-Audio VoiceMeeter AUX VAIO 内核驱动（vbaudio_vmauxvaio64_win10.sys）IOCTL_MDL_MAP (0x222044) 关闭设备句柄时未清理 MDL 用户态映射，导致低权限用户可读写内核非分页池内存
+VB-Audio VoiceMeeter AUX VAIO 内核驱动（vbaudio_vmauxvaio64_win10.sys）IOCTL_MDL_MAP (0x222044) 在关闭设备句柄时未清理 MDL 用户态映射，导致低权限用户可保留对已释放非分页池页的可写陈旧映射。
 
 ## 受影响 URL/区域
 
@@ -12,7 +12,7 @@ VB-Audio VoiceMeeter AUX VAIO 内核驱动（vbaudio_vmauxvaio64_win10.sys）IOC
 | 文件版本 | 6.1.7600.16385（编译于 2019-01-12） |
 | SHA256 | d973e54540eb8a49bf3ada385ba04b60d93091ab1242c66f00ddc79e5623e8c6 |
 | 受影响函数 | `FUN_00013f2c` @ RVA 0x13f2c — KS 属性处理器，IOCTL 0x222044 分支 |
-| 漏洞位置 | `MmMapLockedPagesSpecifyCache(MDL, AccessMode=1)` 创建用户态可访问的内核池映射；CloseHandle 时 PortCls 清理路径释放池内存，但**未调用 `MmUnmapLockedPages`** |
+| 漏洞位置 | `MmMapLockedPagesSpecifyCache(MDL, AccessMode=1)` 创建用户态可访问的内核池映射；关闭/清理路径释放底层池内存，但**未在正确上下文中调用 `MmUnmapLockedPages`** |
 | 驱动厂商 | VB-Audio / Vincent Burel |
 | 产品 | VoiceMeeter 虚拟音频设备 |
 
@@ -22,47 +22,47 @@ VB-Audio VoiceMeeter AUX VAIO 内核驱动（vbaudio_vmauxvaio64_win10.sys）IOC
 
 | 字段 | 值 |
 |---|---|
-| CWE-ID | **CWE-416**（释放后使用） |
-| CVSS 分数 | **7.8** — CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H |
-| 漏洞类型 | 释放后使用 / 内核资源清理缺失 |
-| 严重程度 | **严重（Critical）** |
-| 风险评级 | **高（High）** |
+| CWE-ID | **CWE-416**（主问题，释放后仍通过旧引用访问内存） |
+| CVSS 分数 | **7.8 High** — CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H |
+| 漏洞类型 | 陈旧用户态映射 / 内核资源清理缺失 / 非分页池 UAF |
+| 严重程度 | **High / 需紧急修复** |
+| 风险评级 | **High** |
 
 低权限本地用户可利用此漏洞实现：
 
-- 任意**读取**内核非分页池内存（最多 4 MB）
-- 任意**写入**内核非分页池内存（最多 4 MB）
-- 内核虚拟地址信息泄露（KASLR 绕过已确认）
+- 在关闭设备句柄或清理路径后，继续保留对已释放非分页池页的用户态读写访问；
+- 在测试环境中观察到可达约 4 MB 的可读写范围，并可观测到内核池内容与内核地址泄露；
+- 该原语可能进一步导致更广泛的内核对象损坏，但当前测试环境未证实稳定提权。
 
 ### 同驱动中发现的其他漏洞
 
 | # | CWE | 描述 |
 |---|---|---|
-| 1 | CWE-415 / CWE-362 | `FUN_00013ec0` @ RVA 0x13ec0 双释放竞态：`IoFreeMdl` 在指针清零前调用，多线程 `IOCTL_MDL_MAP` 可触发 → BSOD `KERNEL_MODE_HEAP_CORRUPTION (0x13A)` |
-| 2 | CWE-20 | MDL 长度计算使用攻击者可控的缓冲区字段 `DAT_00017f78[10]` (偏移 +0x28) 和 `DAT_00017f78[0xb]` (偏移 +0x2C)，无校验 → 攻击者可将映射扩展至 4 MB |
-| 3 | CWE-416 | 活缓冲区别名：CloseHandle → 重新打开通过 LFH 缓存复用同一物理页，陈旧映射与活映射之间可双向读写 |
+| 1 | CWE-362 / CWE-415 | `FUN_00013ec0` 中存在 MDL 清理 TOCTOU：并发调用可能导致同一 MDL 被重复释放，测试环境中可复现 `KERNEL_MODE_HEAP_CORRUPTION (0x13A)` |
+| 2 | CWE-20 | MDL 长度字段（来自缓冲区元数据）缺少边界校验，攻击者可通过陈旧映射修改后续 `IoAllocateMdl` 的长度，扩大映射范围 |
+| 3 | CWE-416 | 关闭路径释放底层池缓冲区后，旧用户态映射仍有效，形成陈旧映射访问 |
 
 ## 漏洞描述
 
 VB-Audio VoiceMeeter AUX VAIO 内核驱动通过自定义 IOCTL `IOCTL_MDL_MAP`（控制码 `0x222044`）创建了用户态可访问的内核非分页池内存映射。
 
-当用户态应用以参数 `flag=1` 发送此 IOCTL 时，驱动调用 `IoAllocateMdl(DAT_00017f78, length, ...)` 后调用 `MmMapLockedPagesSpecifyCache(MDL, AccessMode=1, ...)`。`AccessMode=1` 参数在内核虚拟地址空间中创建了一个用户态可访问的映射。驱动通过 IOCTL 输出缓冲区将映射的用户态虚拟地址返回给调用方。
+当用户态应用以参数 `flag=1` 发送此 IOCTL 时，驱动调用 `IoAllocateMdl(DAT_00017f78, length, ...)` 后调用 `MmMapLockedPagesSpecifyCache(MDL, AccessMode=1, ...)`。`AccessMode=1` 参数表示在原始调用进程上下文中创建用户态可访问的映射；这本身是 WDK 中合法的用法，但漏洞在于驱动在底层缓冲区释放前没有正确撤销该映射。
 
-当设备句柄被关闭（`CloseHandle`）时，PortCls 框架触发音频流清理。清理过程中（`FUN_00019630`），底层内核池缓冲区（`DAT_00017f78`）通过 `ExFreePoolWithTag` 被释放。然而，对应的 `MmUnmapLockedPages` 从未被调用。映射内核池页面到用户态虚拟地址空间的用户态页表项（PTE）**未被注销**。该用户态映射以"陈旧映射"形式继续存活，持续指向已释放的内核池页面。
+关闭设备句柄时，PortCls 框架触发音频流清理。清理过程中（`FUN_00019630`），底层内核池缓冲区（`DAT_00017f78`）通过 `ExFreePoolWithTag` 被释放。然而，对应的 `MmUnmapLockedPages` 未在原始映射上下文中执行。映射到用户地址空间的 PTE 仍然保留，导致调用进程持有一个“陈旧映射”，继续引用已释放的内核池页。
 
-攻击者可以继续通过该陈旧用户态虚拟地址进行读写操作，使用户态代码获得对内核非分页池内存的直接访问能力——已确认至少可访问 689,136 字节（168 页）的原始映射。通过操纵陈旧映射中偏移 `+0x28` 和 `+0x2C` 处的缓冲区头字段，攻击者可在后续 `IOCTL_MDL_MAP` 调用中扩展 MDL 长度，映射多达 4,194,304 字节（1024 页）的相邻非分页池，覆盖内核对象数据并泄露 500+ 个池标签及数百个内核虚拟地址。
+攻击者可以继续通过该陈旧用户态虚拟地址进行读写操作；在当前 PoC 中，至少对原始映射的 689,136 字节（168 页）进行了连续读取/写入验证。通过操纵陈旧映射中偏移 `+0x28` 和 `+0x2C` 处的缓冲区头字段，攻击者可在后续 `IOCTL_MDL_MAP` 调用中扩展 MDL 长度，映射多达约 4,194,304 字节（1024 页）的相邻非分页池。该原语可用于泄露内核池内容与内核地址，并可能造成更广泛的内核对象损坏，但当前测试环境尚未证实稳定的任意内核地址读写或 SYSTEM 提权。
 
-该漏洞通过 Ghidra 静态逆向工程发现，并通过自定义概念验证代码完成动态验证。详细静态分析链路见后文"附录：Ghidra 静态逆向分析链路"。
+该漏洞通过 Ghidra 静态逆向工程发现，并通过自定义概念验证代码完成动态验证。详细静态分析链路见后文“附录：Ghidra 静态逆向分析链路”。
 
 ## 漏洞影响
 
-1. **内核任意读取**：低权限用户可读取最多 4 MB 非分页池内存，泄露内核虚拟地址（已确认 KASLR 绕过——500+ 池标签，数百个内核地址）。
+1. **陈旧映射可读写**：低权限用户可在关闭句柄后继续通过旧用户态地址访问已释放的非分页池页；当前测试环境已观测到约 4 MB 的可读写范围。
 
-2. **内核任意写入**：低权限用户可向内核非分页池页面写入任意数据，实现内核对象损坏。
+2. **内核池内容和地址泄露**：通过保留的陈旧映射，攻击者可读取内核池数据，并观察到内核虚拟地址信息，降低 KASLR 复杂度。
 
-3. **拒绝服务**：双释放竞态条件可被本地低权限用户触发，导致系统立即崩溃（`KERNEL_MODE_HEAP_CORRUPTION`，蓝屏码 `0x13A`）。
+3. **拒绝服务**：并发清理/重建路径下，MDL 双重释放可触发 `KERNEL_MODE_HEAP_CORRUPTION`，测试环境中可复现蓝屏代码 `0x13A`。
 
-4. **潜在权限提升**：借助内核任意读写和 KASLR 绕过，攻击者理论上可定位 System 进程的 EPROCESS 结构并覆写其 Token 以提权至 SYSTEM。（在当前测试环境中未确认——EPROCESS 位于映射范围之外；取决于非分页池的物理布局。）
+4. **潜在更广泛内核对象损坏**：若后续映射长度可被稳定扩展，可能进一步破坏内核对象，但当前尚未在测试环境中证实稳定提权。
 
 ## 复现步骤
 
@@ -108,8 +108,8 @@ cd poc
 2. 创建初始 MDL，然后启动 2 个竞态线程
 3. 每个线程并发发送 `IOCTL_MDL_MAP` flag=1
 4. 竞态命中 `FUN_00013ec0` 中的 TOCTOU 窗口 → 双 `IoFreeMdl` → 蓝屏
-5. 蓝屏码 `0x13A`（KERNEL_MODE_HEAP_CORRUPTION）
-6. **注意**：需要多核 CPU（VM 至少 2 个 vCPU）。单核 VM 无法触发竞态。
+5. 测试环境中可复现 `KERNEL_MODE_HEAP_CORRUPTION (0x13A)`
+6. **说明**：多核环境显著提高竞态命中概率；单核环境下仍可能因抢占、线程切换或内核调度产生交错执行，因此不应将多核视为逻辑上的必要条件。
 
 **步骤 4 — 确认活缓冲区别名**：
 ```powershell
@@ -178,14 +178,14 @@ BugCheckCode: 0x000000000000013A (KERNEL_MODE_HEAP_CORRUPTION)
 
 ### P0（严重）
 
-1. **CloseHandle / 清理路径中调用 `MmUnmapLockedPages`**：
-   在 PortCls 清理路径（或 IRP_MJ_CLEANUP / IRP_MJ_CLOSE 处理器）中，调用 `IOCTL_MDL_MAP` flag=0（或直接调用 `FUN_00013ec0`）以在释放底层池缓冲区之前注销用户态 MDL 映射。
+1. **在原始映射进程上下文中解除用户态映射**：
+   驱动应记录映射所属进程和映射状态，并在原始调用进程上下文中、底层池内存释放前，通过统一且同步的 cleanup 例程执行 `MmUnmapLockedPages`。不要依赖异步 PortCls 回调在未知进程上下文中直接取消用户映射。
 
 2. **校验 MDL 长度字段**：
    在将 `DAT_00017f78[10]` (偏移 +0x28) 和 `DAT_00017f78[0xb]` (偏移 +0x2C) 传递给 `IoAllocateMdl` 之前添加边界检查。MDL 长度不应超过实际池分配大小（`FUN_0001103c` 中计算的 `param_1 * 0x60 + 0xf0`）。
 
-3. **释放后将全局缓冲区指针置 NULL**：
-   在 `FUN_00019630` 中调用 `ExFreePoolWithTag` 后将 `DAT_00017f78` 置为 NULL，防止通过检查非 NULL 的 IOCTL 触发释放后使用。
+3. **释放前完成顺序清理**：
+   推荐顺序为：阻止新 IOCTL / 获取同步锁 → 在正确进程上下文解除用户映射 → 释放 MDL → 释放底层池缓冲区 → 清空全局状态与所属进程引用。将全局指针置空应仅作为辅助防御，而不是替代 `MmUnmapLockedPages`。
 
 ### P1（高）
 
@@ -193,7 +193,7 @@ BugCheckCode: 0x000000000000013A (KERNEL_MODE_HEAP_CORRUPTION)
    将指针清零操作移至 `IoFreeMdl` 调用**之前**，或使用 `InterlockedExchangePointer` 原子加载并清零指针。
 
 5. **为 `FUN_00013f2c` 添加同步**：
-   使用自旋锁序列化访问全局状态（`DAT_00017f78`、`DAT_00017f80`、`DAT_00017dc0`、`DAT_00017858` 等）的并发 IOCTL 请求。
+   使用自旋锁或互斥锁序列化访问全局状态（`DAT_00017f78`、`DAT_00017f80`、`DAT_00017dc0`、`DAT_00017858` 等）的并发 IOCTL 请求。
 
 ### P2（中等）
 
@@ -204,6 +204,19 @@ BugCheckCode: 0x000000000000013A (KERNEL_MODE_HEAP_CORRUPTION)
 
 7. **修复池标签一致性**：
    在所有 `ExFreePoolWithTag` 调用中使用与分配一致的标签（当前部分调用使用 tag `0` 而非分配 tag `0x4456534D`）。
+
+## 建议补充的验证矩阵
+
+若后续提交给厂商、CNA 或漏洞平台，建议补充如下证据：
+
+- 受影响版本安装包版本、SYS 文件版本、SHA-256 与签名链；
+- 标准用户能否成功打开对应设备对象（含 ACL / SDDL 说明）；
+- `IOCTL 0x222044` 的输入输出缓冲区原始十六进制、返回用户 VA 与 MDL 指针；
+- `!mdl` 输出、MDL `ByteCount`、PFN 数量与映射页数；
+- 关闭路径前后同一用户 VA 的可读性变化，以及 `MmUnmapLockedPages` 未命中的 WinDbg 证据；
+- `ExFreePoolWithTag` 命中的断点日志、是否存在 UAF 持续性；
+- 说明 4 MB 是 PoC 主动限制、驱动上游约束还是当前实验稳定性限制；
+- 若未实现提权，明确写为“未证实”。
 
 ## 附录：Ghidra 静态逆向分析链路
 
